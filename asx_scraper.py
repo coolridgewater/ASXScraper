@@ -178,6 +178,19 @@ class ASXScraper:
             'form 604', 'substantial holder', 'substantial shareholder'
         ])
 
+    def determine_document_type(self, headline: str) -> str:
+        """
+        Heuristically determine document type from headline text.
+        """
+        h = (headline or "").lower()
+        if "appendix 3x" in h or "initial director" in h:
+            return "APPENDIX_3X"
+        if "appendix 3y" in h or "change of director" in h or "director's interest" in h:
+            return "APPENDIX_3Y"
+        if "form 604" in h or "substantial holder" in h or "substantial shareholder" in h:
+            return "FORM_604"
+        return "OTHER"
+
     # ---------- Downloads & text extraction ----------
     def download_pdf(self, url: str) -> str:
         if not url:
