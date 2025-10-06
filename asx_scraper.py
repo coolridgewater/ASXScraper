@@ -48,6 +48,24 @@ class ASXScraper:
         self.announcements_page_url = "https://www.asx.com.au/markets/trade-our-cash-market/announcements"
         # Optional JSON API endpoint; if not set we try sensible defaults
         self.announcements_api_url = os.getenv("ASX_ANNOUNCEMENTS_API_URL")
+        # Config: days back to search, only include targets, debug logging
+        self.days_back = max(1, min(int(os.getenv("ASX_DAYS_BACK", "7") or 7), 60))
+        def _parse_bool(val: Optional[str]) -> bool:
+            if val is None:
+                return False
+            v = val.strip().lower()
+            return v in ("1", "true", "yes", "y", "on")
+        # default behavior is to only return target announcements
+        self.only_targets = True
+        # If ASX_INCLUDE_ALL is true, include all
+        if _parse_bool(os.getenv("ASX_INCLUDE_ALL")):
+            self.only_targets = False
+        # If ASX_ONLY_TARGETS is explicitly provided, respect it
+        if os.getenv("ASX_ONLY_TARGETS") is not None:
+            self.only_targets = _parse_bool(os.getenv("ASX_ONLY_TARGETS"))
+        self.debug_fetch = _parse_bool(os.getenv("ASX_DEBUG_FETCH", "false"))
+        self.match_regex_override = os.getenv("ASX_MATCH_REGEX")
+        self.extra_keywords = [k.strip().lower() for k in (os.getenv("ASX_KEYWORDS", "")) .split(",") if k.strip()] if os.getenv("ASX_KEYWORDS") else []
         self.db_path = db_path
 
         if not os.path.exists(self.download_dir):
@@ -186,7 +204,7 @@ class ASXScraper:
         for base in candidate_urls:
             try:
                 # Try up to the last 7 days until we accumulate enough items
-                for day_offset in range(0, 7):
+                for day_offset in range(0, max(1, self.days_back)):
                     if len(announcements) >= limit:
                         break
                     date_iso = (now_utc - timedelta(days=day_offset)).date().isoformat()
@@ -226,55 +244,62 @@ class ASXScraper:
                     if not items:
                         continue
 
-                    for it in items:
-                        try:
-                            code = (it.get("code") or it.get("issuerCode") or it.get("securityCode") or
-                                    it.get("companyCode") or it.get("asxCode") or "").strip()
-                            headline = (it.get("headline") or it.get("title") or it.get("documentHeadline") or
-                                        it.get("announcementTitle") or "").strip()
+                for it in items:
+                    try:
+                        code = (it.get("code") or it.get("issuerCode") or it.get("securityCode") or
+                                it.get("companyCode") or it.get("asxCode") or "").strip()
+                        headline = (it.get("headline") or it.get("title") or it.get("documentHeadline") or
+                                    it.get("announcementTitle") or "").strip()
 
                             # Dates frequently come as ISO timestamps
-                            raw_date = (it.get("date") or it.get("publishedAt") or it.get("announcementDate") or
-                                        it.get("time") or it.get("published") or "")
-                            date_str = ""
-                            if isinstance(raw_date, str) and raw_date:
-                                # Try ISO date extraction
-                                m = re.match(r"(\d{4}-\d{2}-\d{2})", raw_date)
-                                if m:
-                                    date_str = m.group(1)
-                                else:
-                                    # Try dd/mm/yyyy
-                                    m2 = re.match(r"(\d{2}/\d{2}/\d{4})", raw_date)
-                                    date_str = m2.group(1) if m2 else raw_date
+                        raw_date = (it.get("date") or it.get("publishedAt") or it.get("announcementDate") or
+                                    it.get("time") or it.get("published") or "")
+                        date_str = ""
+                        if isinstance(raw_date, str) and raw_date:
+                            # Try ISO date extraction
+                            m = re.match(r"(\d{4}-\d{2}-\d{2})", raw_date)
+                            if m:
+                                date_str = m.group(1)
+                            else:
+                                # Try dd/mm/yyyy
+                                m2 = re.match(r"(\d{2}/\d{2}/\d{4})", raw_date)
+                                date_str = m2.group(1) if m2 else raw_date
 
                             # Extract idsId or similar id to build the PDF URL
-                            ids_id = (it.get("idsId") or it.get("id") or it.get("documentId") or
-                                      it.get("announcementId") or "")
-                            pdf_url = None
-                            if isinstance(ids_id, (str, int)) and str(ids_id):
-                                pdf_url = (
-                                    f"https://www.asx.com.au/asx/statistics/displayAnnouncement.do?display=pdf&idsId={ids_id}"
-                                )
-                            else:
-                                # Some APIs give direct PDF URLs
-                                pdf_url = it.get("pdfUrl") or it.get("url") or None
+                        ids_id = (it.get("idsId") or it.get("id") or it.get("documentId") or
+                                  it.get("announcementId") or "")
+                        pdf_url = None
+                        if isinstance(ids_id, (str, int)) and str(ids_id):
+                            pdf_url = (
+                                f"https://www.asx.com.au/asx/statistics/displayAnnouncement.do?display=pdf&idsId={ids_id}"
+                            )
+                        else:
+                            # Some APIs give direct PDF URLs
+                            pdf_url = it.get("pdfUrl") or it.get("url") or None
 
-                            if not code or not headline:
-                                continue
+                        if not code or not headline:
+                            continue
 
-                            ann = {
-                                "code": code,
-                                "headline": headline,
-                                "date": date_str,
-                                "id": str(ids_id) if ids_id is not None else "",
-                                "url": pdf_url,
-                            }
+                        ann = {
+                            "code": code,
+                            "headline": headline,
+                            "date": date_str,
+                            "id": str(ids_id) if ids_id is not None else "",
+                            "url": pdf_url,
+                        }
+                        if self.only_targets:
                             if self.is_target_announcement(headline):
                                 announcements.append(ann)
-                                if len(announcements) >= limit:
-                                    break
-                        except Exception:
-                            continue
+                                if self.debug_fetch:
+                                    print(f"[ASX JSON] match: {code} | {headline}")
+                        else:
+                            announcements.append(ann)
+                            if self.debug_fetch:
+                                print(f"[ASX JSON] all: {code} | {headline}")
+                        if len(announcements) >= limit:
+                            break
+                    except Exception:
+                        continue
 
                     if len(announcements) >= limit:
                         break
@@ -319,8 +344,15 @@ class ASXScraper:
                             if doc_id else None
                         )
                         ann = {'code': code, 'headline': headline, 'date': date_str, 'id': doc_id, 'url': pdf_url}
-                        if self.is_target_announcement(headline):
+                        if self.only_targets:
+                            if self.is_target_announcement(headline):
+                                announcements.append(ann)
+                                if self.debug_fetch:
+                                    print(f"[ASX HTML] match: {code} | {headline}")
+                        else:
                             announcements.append(ann)
+                            if self.debug_fetch:
+                                print(f"[ASX HTML] all: {code} | {headline}")
                 except Exception:
                     continue
             return announcements
@@ -328,12 +360,40 @@ class ASXScraper:
             return []
 
     def is_target_announcement(self, headline: str) -> bool:
-        h = (headline or "").lower()
-        return any(x in h for x in [
-            'appendix 3y', 'change of director', "director's interest",
-            'appendix 3x', 'initial director',
-            'form 604', 'substantial holder', 'substantial shareholder'
-        ])
+        h = (headline or "").strip().lower()
+        # Normalize common punctuation variants
+        h = h.replace("\u2019", "'").replace("\u2018", "'").replace("\u2013", "-").replace("\u2014", "-")
+        if self.match_regex_override:
+            try:
+                return re.search(self.match_regex_override, h, re.I) is not None
+            except Exception:
+                pass
+
+        # Regex patterns capturing common variations
+        patterns = [
+            r"appendix\s*3x",
+            r"appendix\s*3y",
+            r"appendix\s*3z",
+            r"change\s+of\s+director",
+            r"director[^\n]*interest",
+            r"form\s*603",
+            r"form\s*604",
+            r"form\s*605",
+            r"substantial\s+(holder|shareholder|holding)",
+            r"initial\s+director",
+            r"final\s+director",
+        ]
+        # Keyword fallback including user-provided extras
+        keywords = [
+            'appendix 3y', "change of director", "director's interest",
+            'appendix 3x', 'appendix 3z', 'initial director', 'final director',
+            'form 603', 'form 604', 'form 605',
+            'substantial holder', 'substantial shareholder', 'substantial holding'
+        ] + self.extra_keywords
+
+        if any(re.search(p, h, re.I) for p in patterns):
+            return True
+        return any(k in h for k in keywords)
 
     def determine_document_type(self, headline: str) -> str:
         """
@@ -344,8 +404,11 @@ class ASXScraper:
             return "APPENDIX_3X"
         if "appendix 3y" in h or "change of director" in h or "director's interest" in h:
             return "APPENDIX_3Y"
-        if "form 604" in h or "substantial holder" in h or "substantial shareholder" in h:
-            return "FORM_604"
+        if "appendix 3z" in h or "final director" in h:
+            return "APPENDIX_3Y"  # Treat 3Z as director interest class for formatting
+        if ("form 603" in h or "form 604" in h or "form 605" in h or
+                "substantial holder" in h or "substantial shareholder" in h or "substantial holding" in h):
+            return "FORM_604"  # Normalize 603/605 to 604 family for downstream formatting
         return "OTHER"
 
     # ---------- Downloads & text extraction ----------
