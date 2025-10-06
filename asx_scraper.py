@@ -18,7 +18,7 @@ import pdfplumber
 import pytesseract
 import traceback
 from pdf2image import convert_from_path
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Optional
 from contextlib import contextmanager
 
@@ -161,97 +161,105 @@ class ASXScraper:
             "https://www.asx.com.au/asx/1/announcements/search",
         ])
 
-        # Build a reasonable time window (today) to avoid huge payloads
-        # If the API supports it, pass limit as itemsPerPage/limit
-        today_iso = datetime.utcnow().strftime("%Y-%m-%d")
+        # Build a reasonable time window (last 7 days) to avoid empty results
+        # Use timezone-aware UTC datetimes to avoid deprecation warnings
+        now_utc = datetime.now(timezone.utc)
 
         for base in candidate_urls:
             try:
-                # Try common param names; some endpoints ignore unknown params
-                params = {
-                    "limit": str(max(1, min(limit, 100))),
-                    "itemsPerPage": str(max(1, min(limit, 100))),
-                    "publishedAfter": f"{today_iso}T00:00:00Z",
-                    "publishedBefore": f"{today_iso}T23:59:59Z",
-                }
-                resp = self.session.get(base, params=params, timeout=15)
-                if resp.status_code != 200:
-                    continue
-                data = resp.json()
+                # Try up to the last 7 days until we accumulate enough items
+                for day_offset in range(0, 7):
+                    if len(announcements) >= limit:
+                        break
+                    date_iso = (now_utc - timedelta(days=day_offset)).date().isoformat()
+                    # Try common param names; some endpoints ignore unknown params
+                    params = {
+                        "limit": str(max(1, min(limit, 100))),
+                        "itemsPerPage": str(max(1, min(limit, 100))),
+                        "publishedAfter": f"{date_iso}T00:00:00Z",
+                        "publishedBefore": f"{date_iso}T23:59:59Z",
+                    }
+                    resp = self.session.get(base, params=params, timeout=15)
+                    if resp.status_code != 200:
+                        continue
+                    data = resp.json()
 
-                # Normalize items array from various possible shapes
-                items = None
-                if isinstance(data, list):
-                    items = data
-                elif isinstance(data, dict):
-                    for key in ("data", "items", "results", "announcements", "content"):
-                        if key in data and isinstance(data[key], list):
-                            items = data[key]
-                            break
-                    # Some APIs nest a page object
-                    if items is None:
-                        for key in ("page", "payload"):
-                            if key in data and isinstance(data[key], dict):
-                                nested = data[key]
-                                for k in ("items", "content", "data"):
-                                    if k in nested and isinstance(nested[k], list):
-                                        items = nested[k]
+                    # Normalize items array from various possible shapes
+                    items = None
+                    if isinstance(data, list):
+                        items = data
+                    elif isinstance(data, dict):
+                        for key in ("data", "items", "results", "announcements", "content"):
+                            if key in data and isinstance(data[key], list):
+                                items = data[key]
+                                break
+                        # Some APIs nest a page object
+                        if items is None:
+                            for key in ("page", "payload"):
+                                if key in data and isinstance(data[key], dict):
+                                    nested = data[key]
+                                    for k in ("items", "content", "data"):
+                                        if k in nested and isinstance(nested[k], list):
+                                            items = nested[k]
+                                            break
+                                    if items is not None:
                                         break
-                                if items is not None:
-                                    break
 
-                if not items:
-                    continue
+                    if not items:
+                        continue
 
-                for it in items:
-                    try:
-                        code = (it.get("code") or it.get("issuerCode") or it.get("securityCode") or
-                                it.get("companyCode") or it.get("asxCode") or "").strip()
-                        headline = (it.get("headline") or it.get("title") or it.get("documentHeadline") or
-                                    it.get("announcementTitle") or "").strip()
+                    for it in items:
+                        try:
+                            code = (it.get("code") or it.get("issuerCode") or it.get("securityCode") or
+                                    it.get("companyCode") or it.get("asxCode") or "").strip()
+                            headline = (it.get("headline") or it.get("title") or it.get("documentHeadline") or
+                                        it.get("announcementTitle") or "").strip()
 
-                        # Dates frequently come as ISO timestamps
-                        raw_date = (it.get("date") or it.get("publishedAt") or it.get("announcementDate") or
-                                    it.get("time") or it.get("published") or "")
-                        date_str = ""
-                        if isinstance(raw_date, str) and raw_date:
-                            # Try ISO date extraction
-                            m = re.match(r"(\d{4}-\d{2}-\d{2})", raw_date)
-                            if m:
-                                date_str = m.group(1)
+                            # Dates frequently come as ISO timestamps
+                            raw_date = (it.get("date") or it.get("publishedAt") or it.get("announcementDate") or
+                                        it.get("time") or it.get("published") or "")
+                            date_str = ""
+                            if isinstance(raw_date, str) and raw_date:
+                                # Try ISO date extraction
+                                m = re.match(r"(\d{4}-\d{2}-\d{2})", raw_date)
+                                if m:
+                                    date_str = m.group(1)
+                                else:
+                                    # Try dd/mm/yyyy
+                                    m2 = re.match(r"(\d{2}/\d{2}/\d{4})", raw_date)
+                                    date_str = m2.group(1) if m2 else raw_date
+
+                            # Extract idsId or similar id to build the PDF URL
+                            ids_id = (it.get("idsId") or it.get("id") or it.get("documentId") or
+                                      it.get("announcementId") or "")
+                            pdf_url = None
+                            if isinstance(ids_id, (str, int)) and str(ids_id):
+                                pdf_url = (
+                                    f"https://www.asx.com.au/asx/statistics/displayAnnouncement.do?display=pdf&idsId={ids_id}"
+                                )
                             else:
-                                # Try dd/mm/yyyy
-                                m2 = re.match(r"(\d{2}/\d{2}/\d{4})", raw_date)
-                                date_str = m2.group(1) if m2 else raw_date
+                                # Some APIs give direct PDF URLs
+                                pdf_url = it.get("pdfUrl") or it.get("url") or None
 
-                        # Extract idsId or similar id to build the PDF URL
-                        ids_id = (it.get("idsId") or it.get("id") or it.get("documentId") or
-                                  it.get("announcementId") or "")
-                        pdf_url = None
-                        if isinstance(ids_id, (str, int)) and str(ids_id):
-                            pdf_url = (
-                                f"https://www.asx.com.au/asx/statistics/displayAnnouncement.do?display=pdf&idsId={ids_id}"
-                            )
-                        else:
-                            # Some APIs give direct PDF URLs
-                            pdf_url = it.get("pdfUrl") or it.get("url") or None
+                            if not code or not headline:
+                                continue
 
-                        if not code or not headline:
+                            ann = {
+                                "code": code,
+                                "headline": headline,
+                                "date": date_str,
+                                "id": str(ids_id) if ids_id is not None else "",
+                                "url": pdf_url,
+                            }
+                            if self.is_target_announcement(headline):
+                                announcements.append(ann)
+                                if len(announcements) >= limit:
+                                    break
+                        except Exception:
                             continue
 
-                        ann = {
-                            "code": code,
-                            "headline": headline,
-                            "date": date_str,
-                            "id": str(ids_id) if ids_id is not None else "",
-                            "url": pdf_url,
-                        }
-                        if self.is_target_announcement(headline):
-                            announcements.append(ann)
-                            if len(announcements) >= limit:
-                                break
-                    except Exception:
-                        continue
+                    if len(announcements) >= limit:
+                        break
 
                 if announcements:
                     return announcements
