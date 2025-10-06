@@ -60,10 +60,28 @@ class ASXScraper:
             'Accept-Language': 'en-US,en;q=0.5'
         })
 
-        # OpenAI key must be set in env var OPENAI_API_KEY
-        self.openai_api_key = os.getenv("OPENAI_API_KEY")
+        # OpenAI API key lookup with multiple fallbacks
+        # Primary: OPENAI_API_KEY; also support OPEN_API_KEY and common aliases
+        self.openai_api_key = (
+            os.getenv("OPENAI_API_KEY")
+            or os.getenv("OPEN_API_KEY")
+            or os.getenv("OPENAI_KEY")
+            or os.getenv("OPENAI_TOKEN")
+        )
         if not self.openai_api_key:
-            print("Warning: OPENAI_API_KEY not set. AI parsing will fail until configured.")
+            # As a convenience, if a file named 'OPEN_API_KEY' exists, read from it
+            key_file_path = os.path.join(os.getcwd(), "OPEN_API_KEY")
+            if os.path.isfile(key_file_path):
+                try:
+                    with open(key_file_path, "r", encoding="utf-8") as f:
+                        key_candidate = f.read().strip()
+                        if key_candidate:
+                            self.openai_api_key = key_candidate
+                except Exception:
+                    pass
+
+        if not self.openai_api_key:
+            print("Warning: OpenAI API key not set. Set OPENAI_API_KEY or OPEN_API_KEY in your environment or .env.")
         else:
             if openai:
                 openai.api_key = self.openai_api_key
