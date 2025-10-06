@@ -46,6 +46,8 @@ class ASXScraper:
         self.base_url = "https://www.asx.com.au"
         self.download_dir = "./asx_downloads"
         self.announcements_page_url = "https://www.asx.com.au/markets/trade-our-cash-market/announcements"
+        # Optional JSON API endpoint; if not set we try sensible defaults
+        self.announcements_api_url = os.getenv("ASX_ANNOUNCEMENTS_API_URL")
         self.db_path = db_path
 
         if not os.path.exists(self.download_dir):
@@ -132,8 +134,134 @@ class ASXScraper:
         unique_string = f"{asx_code}_{document_title}_{date}"
         return hashlib.md5(unique_string.encode()).hexdigest()
 
-    # ---------- Fetching announcements (unchanged) ----------
+    # ---------- Fetching announcements (JSON API with HTML fallback) ----------
     def fetch_announcements(self, limit: int = 20) -> List[Dict]:
+        anns = self._fetch_announcements_json(limit=limit)
+        if anns:
+            # Ensure we don't exceed the requested limit
+            return anns[:limit]
+        # Fallback to HTML if JSON fails/empty
+        return self._fetch_announcements_html(limit=limit)
+
+    def _fetch_announcements_json(self, limit: int = 20) -> List[Dict]:
+        """
+        Fetch announcements via ASX JSON API. If ASX_ANNOUNCEMENTS_API_URL is set, use it.
+        Otherwise, try a small set of known endpoints. Returns a list of dicts
+        with keys: code, headline, date (YYYY-MM-DD or source format), id, url.
+        """
+        announcements: List[Dict] = []
+        # Candidate API endpoints to try (first configured via env)
+        candidate_urls: List[str] = []
+        if self.announcements_api_url:
+            candidate_urls.append(self.announcements_api_url)
+        # Common public endpoints historically used by ASX (may change)
+        candidate_urls.extend([
+            "https://www.asx.com.au/asx/1/announcements",
+            # Some deployments expose a search endpoint; harmless to try
+            "https://www.asx.com.au/asx/1/announcements/search",
+        ])
+
+        # Build a reasonable time window (today) to avoid huge payloads
+        # If the API supports it, pass limit as itemsPerPage/limit
+        today_iso = datetime.utcnow().strftime("%Y-%m-%d")
+
+        for base in candidate_urls:
+            try:
+                # Try common param names; some endpoints ignore unknown params
+                params = {
+                    "limit": str(max(1, min(limit, 100))),
+                    "itemsPerPage": str(max(1, min(limit, 100))),
+                    "publishedAfter": f"{today_iso}T00:00:00Z",
+                    "publishedBefore": f"{today_iso}T23:59:59Z",
+                }
+                resp = self.session.get(base, params=params, timeout=15)
+                if resp.status_code != 200:
+                    continue
+                data = resp.json()
+
+                # Normalize items array from various possible shapes
+                items = None
+                if isinstance(data, list):
+                    items = data
+                elif isinstance(data, dict):
+                    for key in ("data", "items", "results", "announcements", "content"):
+                        if key in data and isinstance(data[key], list):
+                            items = data[key]
+                            break
+                    # Some APIs nest a page object
+                    if items is None:
+                        for key in ("page", "payload"):
+                            if key in data and isinstance(data[key], dict):
+                                nested = data[key]
+                                for k in ("items", "content", "data"):
+                                    if k in nested and isinstance(nested[k], list):
+                                        items = nested[k]
+                                        break
+                                if items is not None:
+                                    break
+
+                if not items:
+                    continue
+
+                for it in items:
+                    try:
+                        code = (it.get("code") or it.get("issuerCode") or it.get("securityCode") or
+                                it.get("companyCode") or it.get("asxCode") or "").strip()
+                        headline = (it.get("headline") or it.get("title") or it.get("documentHeadline") or
+                                    it.get("announcementTitle") or "").strip()
+
+                        # Dates frequently come as ISO timestamps
+                        raw_date = (it.get("date") or it.get("publishedAt") or it.get("announcementDate") or
+                                    it.get("time") or it.get("published") or "")
+                        date_str = ""
+                        if isinstance(raw_date, str) and raw_date:
+                            # Try ISO date extraction
+                            m = re.match(r"(\d{4}-\d{2}-\d{2})", raw_date)
+                            if m:
+                                date_str = m.group(1)
+                            else:
+                                # Try dd/mm/yyyy
+                                m2 = re.match(r"(\d{2}/\d{2}/\d{4})", raw_date)
+                                date_str = m2.group(1) if m2 else raw_date
+
+                        # Extract idsId or similar id to build the PDF URL
+                        ids_id = (it.get("idsId") or it.get("id") or it.get("documentId") or
+                                  it.get("announcementId") or "")
+                        pdf_url = None
+                        if isinstance(ids_id, (str, int)) and str(ids_id):
+                            pdf_url = (
+                                f"https://www.asx.com.au/asx/statistics/displayAnnouncement.do?display=pdf&idsId={ids_id}"
+                            )
+                        else:
+                            # Some APIs give direct PDF URLs
+                            pdf_url = it.get("pdfUrl") or it.get("url") or None
+
+                        if not code or not headline:
+                            continue
+
+                        ann = {
+                            "code": code,
+                            "headline": headline,
+                            "date": date_str,
+                            "id": str(ids_id) if ids_id is not None else "",
+                            "url": pdf_url,
+                        }
+                        if self.is_target_announcement(headline):
+                            announcements.append(ann)
+                            if len(announcements) >= limit:
+                                break
+                    except Exception:
+                        continue
+
+                if announcements:
+                    return announcements
+            except Exception:
+                continue
+
+        return announcements
+
+    def _fetch_announcements_html(self, limit: int = 20) -> List[Dict]:
+        """Fallback HTML scraper if JSON API is unavailable."""
         try:
             url = f"{self.announcements_page_url}?market=1&csv=false"
             resp = self.session.get(url, timeout=15)
@@ -141,7 +269,7 @@ class ASXScraper:
                 return []
             soup = BeautifulSoup(resp.text, 'html.parser')
             rows = soup.select("tr")
-            announcements = []
+            announcements: List[Dict] = []
             if not rows or len(rows) <= 1:
                 return announcements
             for row in rows[1:]:
@@ -160,7 +288,10 @@ class ASXScraper:
                         doc_id = ""
                         if doc_link and "idsId=" in doc_link:
                             doc_id = doc_link.split("idsId=")[1].split("&")[0]
-                        pdf_url = f"https://www.asx.com.au/asx/statistics/displayAnnouncement.do?display=pdf&idsId={doc_id}" if doc_id else None
+                        pdf_url = (
+                            f"https://www.asx.com.au/asx/statistics/displayAnnouncement.do?display=pdf&idsId={doc_id}"
+                            if doc_id else None
+                        )
                         ann = {'code': code, 'headline': headline, 'date': date_str, 'id': doc_id, 'url': pdf_url}
                         if self.is_target_announcement(headline):
                             announcements.append(ann)
