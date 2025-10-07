@@ -190,18 +190,92 @@ class ASXScraper:
         return hashlib.md5(unique_string.encode()).hexdigest()
 
     # ---------- Fetching announcements (JSON API with HTML fallback) ----------
-    def fetch_announcements(self, limit: int = 20) -> List[Dict]:
-        anns = self._fetch_announcements_json(limit=limit)
-        if anns:
-            print(f"[debug] JSON API returned {len(anns)} announcements (limit {limit}).")
-            # Ensure we don't exceed the requested limit
-            return anns[:limit]
-        else:
-            print("[debug] JSON API yielded 0 announcements; falling back to HTML scrape.")
-        # Fallback to HTML if JSON fails/empty
+    def fetch_announcements(self, limit: int = 20, source: str = "json") -> List[Dict]:
+        source = (source or "json").lower()
+        if source not in ("json", "html", "auto"):
+            source = "json"
+
+        if source in ("json", "auto"):
+            anns = self._fetch_announcements_markit(limit=limit)
+            if anns:
+                print(f"[debug] Markit JSON feed returned {len(anns)} announcements (limit {limit}).")
+                return anns[:limit]
+            if source == "json":
+                print("[info] JSON feed returned no announcements; falling back to HTML.")
+
         html_anns = self._fetch_announcements_html(limit=limit)
         print(f"[debug] HTML scrape returned {len(html_anns)} announcements (limit {limit}).")
         return html_anns
+
+    def _fetch_announcements_markit(self, limit: int = 20) -> List[Dict]:
+        """
+        Fetch announcements via Markit Digital JSON feed.
+        """
+        url = "https://asx.api.markitdigital.com/asx-research/1.0/home/announcements"
+        params = {
+            "numberOfAnnouncements": str(max(1, min(limit, 50))),
+        }
+        try:
+            resp = self.session.get(url, params=params, timeout=20)
+        except Exception as exc:
+            print(f"[debug] JSON feed error: {exc}")
+            return []
+
+        if resp.status_code != 200:
+            print(f"[debug] JSON feed status {resp.status_code}")
+            return []
+
+        try:
+            payload = resp.json()
+        except ValueError:
+            print("[debug] JSON feed returned invalid JSON.")
+            return []
+
+        items = []
+        data_block = payload.get("data")
+        if isinstance(data_block, dict):
+            items = data_block.get("items") or []
+        if not isinstance(items, list):
+            print("[debug] JSON feed items missing or malformed.")
+            return []
+
+        announcements: List[Dict] = []
+        for entry in items:
+            if len(announcements) >= limit:
+                break
+
+            try:
+                code = (entry.get("symbol") or "").strip()
+                headline = (entry.get("headline") or "").strip()
+                document_key = (entry.get("documentKey") or "").strip()
+                iso_date = entry.get("date") or ""
+                company_name = (entry.get("displayName") or "").strip()
+
+                if not code or not headline or not document_key:
+                    continue
+
+                announcement_date = ""
+                if isinstance(iso_date, str) and iso_date:
+                    try:
+                        announcement_date = datetime.fromisoformat(iso_date.replace("Z", "+00:00")).date().isoformat()
+                    except Exception:
+                        announcement_date = iso_date
+
+                pdf_url = f"https://cdn-api.markitdigital.com/apiman-gateway/ASX/asx-research/1.0/file/{document_key}"
+                announcement_id = document_key
+
+                announcements.append({
+                    "code": code,
+                    "headline": headline,
+                    "date": announcement_date,
+                    "id": announcement_id,
+                    "url": pdf_url,
+                    "company_name": company_name,
+                })
+            except Exception:
+                continue
+
+        return announcements
 
     def _fetch_announcements_json(self, limit: int = 20) -> List[Dict]:
         """
@@ -970,10 +1044,26 @@ class ASXScraper:
             return False
 
 # ---------- If run as script ----------
+def _prompt_data_source() -> str:
+    print("Select announcement source:")
+    print("  1) JSON feed (Markit Digital)")
+    print("  2) HTML scrape (requires OpenAI key for PDF parsing)")
+    choice = input("Enter choice [1/2]: ").strip()
+    if choice == "2":
+        return "html"
+    if choice.lower() in ("auto", "a"):
+        return "auto"
+    return "json"
+
+
 def main():
     scraper = ASXScraper()
-    print("Fetching announcements...")
-    anns = scraper.fetch_announcements(limit=20)
+    source = _prompt_data_source()
+    if source == "html" and not scraper.openai_api_key:
+        print("Warning: HTML mode needs OPENAI_API_KEY configured to parse PDFs.")
+
+    print(f"Fetching announcements using {source.upper()} source...")
+    anns = scraper.fetch_announcements(limit=20, source=source)
     processed = 0
     for a in anns:
         if scraper.process_announcement(a):
