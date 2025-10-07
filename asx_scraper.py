@@ -18,9 +18,10 @@ import pdfplumber
 import pytesseract
 import traceback
 from pdf2image import convert_from_path
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Optional
 from contextlib import contextmanager
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -46,6 +47,26 @@ class ASXScraper:
         self.base_url = "https://www.asx.com.au"
         self.download_dir = "./asx_downloads"
         self.announcements_page_url = "https://www.asx.com.au/markets/trade-our-cash-market/announcements"
+        # Optional JSON API endpoint; if not set we try sensible defaults
+        self.announcements_api_url = os.getenv("ASX_ANNOUNCEMENTS_API_URL")
+        # Config: days back to search, only include targets, debug logging
+        self.days_back = max(1, min(int(os.getenv("ASX_DAYS_BACK", "7") or 7), 60))
+        def _parse_bool(val: Optional[str]) -> bool:
+            if val is None:
+                return False
+            v = val.strip().lower()
+            return v in ("1", "true", "yes", "y", "on")
+        # default behavior is to only return target announcements
+        self.only_targets = True
+        # If ASX_INCLUDE_ALL is true, include all
+        if _parse_bool(os.getenv("ASX_INCLUDE_ALL")):
+            self.only_targets = False
+        # If ASX_ONLY_TARGETS is explicitly provided, respect it
+        if os.getenv("ASX_ONLY_TARGETS") is not None:
+            self.only_targets = _parse_bool(os.getenv("ASX_ONLY_TARGETS"))
+        self.debug_fetch = _parse_bool(os.getenv("ASX_DEBUG_FETCH", "false"))
+        self.match_regex_override = os.getenv("ASX_MATCH_REGEX")
+        self.extra_keywords = [k.strip().lower() for k in (os.getenv("ASX_KEYWORDS", "")) .split(",") if k.strip()] if os.getenv("ASX_KEYWORDS") else []
         self.db_path = db_path
 
         if not os.path.exists(self.download_dir):
@@ -58,12 +79,48 @@ class ASXScraper:
             'Accept-Language': 'en-US,en;q=0.5'
         })
 
-        # OpenAI key must be set in env var OPENAI_API_KEY
-        self.openai_api_key = os.getenv("OPENAI_API_KEY")
+        # OpenAI API key lookup with multiple fallbacks
+        # Primary: OPENAI_API_KEY; also support OPEN_API_KEY and common aliases
+        self.openai_api_key = (
+            os.getenv("OPENAI_API_KEY")
+            or os.getenv("OPEN_API_KEY")
+            or os.getenv("OPENAI_KEY")
+            or os.getenv("OPENAI_TOKEN")
+        )
         if not self.openai_api_key:
-            print("Warning: OPENAI_API_KEY not set. AI parsing will fail until configured.")
+            # As a convenience, if a file named 'OPEN_API_KEY' exists, read from it
+            key_file_path = os.path.join(os.getcwd(), "OPEN_API_KEY")
+            if os.path.isfile(key_file_path):
+                try:
+                    with open(key_file_path, "r", encoding="utf-8") as f:
+                        key_candidate = f.read().strip()
+                        if key_candidate:
+                            self.openai_api_key = key_candidate
+                except Exception:
+                    pass
+
+        self._use_new_openai = False
+        self._openai_client = None
+        self._OpenAI_cls = None
+
+        if not self.openai_api_key:
+            print("Warning: OpenAI API key not set. Set OPENAI_API_KEY or OPEN_API_KEY in your environment or .env.")
         else:
-            if openai:
+            try:
+                from openai import OpenAI  # type: ignore
+                self._OpenAI_cls = OpenAI
+            except Exception:
+                self._OpenAI_cls = None
+
+            if self._OpenAI_cls:
+                try:
+                    self._openai_client = self._OpenAI_cls(api_key=self.openai_api_key)
+                    self._use_new_openai = True
+                except Exception:
+                    self._openai_client = None
+                    self._use_new_openai = False
+
+            if not self._use_new_openai and openai:
                 openai.api_key = self.openai_api_key
 
         self.init_database()
@@ -132,38 +189,223 @@ class ASXScraper:
         unique_string = f"{asx_code}_{document_title}_{date}"
         return hashlib.md5(unique_string.encode()).hexdigest()
 
-    # ---------- Fetching announcements (unchanged) ----------
+    # ---------- Fetching announcements (JSON API with HTML fallback) ----------
     def fetch_announcements(self, limit: int = 20) -> List[Dict]:
+        anns = self._fetch_announcements_json(limit=limit)
+        if anns:
+            print(f"[debug] JSON API returned {len(anns)} announcements (limit {limit}).")
+            # Ensure we don't exceed the requested limit
+            return anns[:limit]
+        else:
+            print("[debug] JSON API yielded 0 announcements; falling back to HTML scrape.")
+        # Fallback to HTML if JSON fails/empty
+        html_anns = self._fetch_announcements_html(limit=limit)
+        print(f"[debug] HTML scrape returned {len(html_anns)} announcements (limit {limit}).")
+        return html_anns
+
+    def _fetch_announcements_json(self, limit: int = 20) -> List[Dict]:
+        """
+        Fetch announcements via ASX JSON API. If ASX_ANNOUNCEMENTS_API_URL is set, use it.
+        Otherwise, try a small set of known endpoints. Returns a list of dicts
+        with keys: code, headline, date (YYYY-MM-DD or source format), id, url.
+        """
+        announcements: List[Dict] = []
+        # Candidate API endpoints to try (first configured via env)
+        candidate_urls: List[str] = []
+        if self.announcements_api_url:
+            candidate_urls.append(self.announcements_api_url)
+        # Common public endpoints historically used by ASX (may change)
+        candidate_urls.extend([
+            "https://www.asx.com.au/asx/1/announcements",
+            # Some deployments expose a search endpoint; harmless to try
+            "https://www.asx.com.au/asx/1/announcements/search",
+        ])
+
+        # Build a reasonable time window (last 7 days) to avoid empty results
+        # Use timezone-aware UTC datetimes to avoid deprecation warnings
+        now_utc = datetime.now(timezone.utc)
+
+        for base in candidate_urls:
+            try:
+                # Try up to the last 7 days until we accumulate enough items
+                for day_offset in range(0, max(1, self.days_back)):
+                    if len(announcements) >= limit:
+                        break
+                    date_iso = (now_utc - timedelta(days=day_offset)).date().isoformat()
+                    # Try common param names; some endpoints ignore unknown params
+                    params = {
+                        "limit": str(max(1, min(limit, 100))),
+                        "itemsPerPage": str(max(1, min(limit, 100))),
+                        "publishedAfter": f"{date_iso}T00:00:00Z",
+                        "publishedBefore": f"{date_iso}T23:59:59Z",
+                    }
+                    print(f"[debug] JSON fetch {base} date={date_iso}")
+                    resp = self.session.get(base, params=params, timeout=15)
+                    if resp.status_code != 200:
+                        print(f"[debug]  -> status {resp.status_code}, skipping.")
+                        continue
+                    data = resp.json()
+                    print(f"[debug]  -> received JSON type {type(data).__name__}")
+
+                    # Normalize items array from various possible shapes
+                    items = None
+                    if isinstance(data, list):
+                        items = data
+                    elif isinstance(data, dict):
+                        for key in ("data", "items", "results", "announcements", "content"):
+                            if key in data and isinstance(data[key], list):
+                                items = data[key]
+                                break
+                        # Some APIs nest a page object
+                        if items is None:
+                            for key in ("page", "payload"):
+                                if key in data and isinstance(data[key], dict):
+                                    nested = data[key]
+                                    for k in ("items", "content", "data"):
+                                        if k in nested and isinstance(nested[k], list):
+                                            items = nested[k]
+                                            break
+                                    if items is not None:
+                                        break
+
+                    if not items:
+                        continue
+
+                for it in items:
+                    try:
+                        code = (it.get("code") or it.get("issuerCode") or it.get("securityCode") or
+                                it.get("companyCode") or it.get("asxCode") or "").strip()
+                        headline = (it.get("headline") or it.get("title") or it.get("documentHeadline") or
+                                    it.get("announcementTitle") or "").strip()
+
+                            # Dates frequently come as ISO timestamps
+                        raw_date = (it.get("date") or it.get("publishedAt") or it.get("announcementDate") or
+                                    it.get("time") or it.get("published") or "")
+                        date_str = ""
+                        if isinstance(raw_date, str) and raw_date:
+                            # Try ISO date extraction
+                            m = re.match(r"(\d{4}-\d{2}-\d{2})", raw_date)
+                            if m:
+                                date_str = m.group(1)
+                            else:
+                                # Try dd/mm/yyyy
+                                m2 = re.match(r"(\d{2}/\d{2}/\d{4})", raw_date)
+                                date_str = m2.group(1) if m2 else raw_date
+
+                            # Extract idsId or similar id to build the PDF URL
+                        ids_id = (it.get("idsId") or it.get("id") or it.get("documentId") or
+                                  it.get("announcementId") or "")
+
+                        pdf_candidate = None
+                        if isinstance(ids_id, (str, int)) and str(ids_id):
+                            pdf_candidate = (
+                                f"https://www.asx.com.au/asx/statistics/displayAnnouncement.do?display=pdf&idsId={ids_id}"
+                            )
+                        else:
+                            pdf_candidate = it.get("pdfUrl") or it.get("url") or None
+
+                        pdf_url = self._resolve_pdf_url(pdf_candidate)
+
+                        if not code or not headline or not pdf_url:
+                            if self.debug_fetch:
+                                print(f"[debug]  -> skip item code={code} headline={headline} pdf_url={pdf_url}")
+                            continue
+
+                        ann_id = ""
+                        if isinstance(ids_id, (str, int)) and str(ids_id):
+                            ann_id = str(ids_id)
+                        else:
+                            ann_id = self._extract_ids_id(pdf_candidate) if pdf_candidate else ""
+                        if not ann_id:
+                            ann_id = self.generate_unique_id(code, headline, date_str or raw_date or str(time.time()))
+
+                        ann = {
+                            "code": code,
+                            "headline": headline,
+                            "date": date_str,
+                            "id": ann_id,
+                            "url": pdf_url,
+                        }
+                        if self.only_targets:
+                            if self.is_target_announcement(headline):
+                                announcements.append(ann)
+                                if self.debug_fetch:
+                                    print(f"[ASX JSON] match: {code} | {headline}")
+                        else:
+                            announcements.append(ann)
+                            if self.debug_fetch:
+                                print(f"[ASX JSON] all: {code} | {headline}")
+                        if len(announcements) >= limit:
+                            break
+                    except Exception:
+                        continue
+
+                    if len(announcements) >= limit:
+                        break
+
+                if announcements:
+                    return announcements
+            except Exception:
+                continue
+
+        return announcements
+
+    def _fetch_announcements_html(self, limit: int = 20) -> List[Dict]:
+        """Fallback HTML scraper if JSON API is unavailable."""
         try:
-            url = f"{self.announcements_page_url}?market=1&csv=false"
+            url = "https://www.asx.com.au/asx/v2/statistics/todayAnns.do"
             resp = self.session.get(url, timeout=15)
+            print(f"[debug] HTML fetch {url} status={resp.status_code}")
             if resp.status_code != 200:
                 return []
             soup = BeautifulSoup(resp.text, 'html.parser')
-            rows = soup.select("tr")
-            announcements = []
+            table = soup.find("table")
+            if not table:
+                print("[debug] No <table> found in HTML response.")
+                return []
+            rows = table.find_all("tr")
+            announcements: List[Dict] = []
+            print(f"[debug] Parsed {len(rows)} table rows from HTML.")
             if not rows or len(rows) <= 1:
                 return announcements
-            for row in rows[1:]:
+            for row in rows:
+                headers = row.find_all("th")
+                if headers:
+                    continue  # skip header row
                 if len(announcements) >= limit:
                     break
                 try:
                     cells = row.find_all("td")
-                    if len(cells) >= 4:
-                        code = cells[0].text.strip()
-                        date_cell = cells[1].text.strip()
-                        date_parts = date_cell.split()
-                        date_str = date_parts[0] if date_parts else ""
-                        headline_cell = cells[3].find('a') if len(cells) > 3 else None
-                        headline = headline_cell.text.strip() if headline_cell else ""
+                    if len(cells) >= 3:
+                        code = cells[0].get_text(strip=True)
+                        date_cell = cells[1].get_text(" ", strip=True)
+                        date_match = re.search(r"\b(\d{1,2}/\d{1,2}/\d{4})\b", date_cell)
+                        date_str = date_match.group(1) if date_match else date_cell
+                        anchor_cell = cells[-1] if cells else None
+                        headline_cell = anchor_cell.find('a') if anchor_cell else None
+                        headline = ""
+                        if headline_cell:
+                            headline_parts = list(headline_cell.stripped_strings)
+                            headline = headline_parts[0] if headline_parts else ""
                         doc_link = headline_cell.get('href') if headline_cell else ""
-                        doc_id = ""
-                        if doc_link and "idsId=" in doc_link:
-                            doc_id = doc_link.split("idsId=")[1].split("&")[0]
-                        pdf_url = f"https://www.asx.com.au/asx/statistics/displayAnnouncement.do?display=pdf&idsId={doc_id}" if doc_id else None
+                        pdf_url = self._resolve_pdf_url(doc_link)
+                        if self.debug_fetch:
+                            print(f"[debug] HTML row code={code} date={date_str} headline={headline} link={doc_link} pdf={pdf_url}")
+                        if not pdf_url:
+                            continue
+                        doc_id = self._extract_ids_id(doc_link) or self._extract_ids_id(pdf_url)
+                        if not doc_id:
+                            doc_id = self.generate_unique_id(code, headline, date_str or str(time.time()))
                         ann = {'code': code, 'headline': headline, 'date': date_str, 'id': doc_id, 'url': pdf_url}
-                        if self.is_target_announcement(headline):
+                        if self.only_targets:
+                            if self.is_target_announcement(headline):
+                                announcements.append(ann)
+                                if self.debug_fetch:
+                                    print(f"[ASX HTML] match: {code} | {headline}")
+                        else:
                             announcements.append(ann)
+                            if self.debug_fetch:
+                                print(f"[ASX HTML] all: {code} | {headline}")
                 except Exception:
                     continue
             return announcements
@@ -171,12 +413,40 @@ class ASXScraper:
             return []
 
     def is_target_announcement(self, headline: str) -> bool:
-        h = (headline or "").lower()
-        return any(x in h for x in [
-            'appendix 3y', 'change of director', "director's interest",
-            'appendix 3x', 'initial director',
-            'form 604', 'substantial holder', 'substantial shareholder'
-        ])
+        h = (headline or "").strip().lower()
+        # Normalize common punctuation variants
+        h = h.replace("\u2019", "'").replace("\u2018", "'").replace("\u2013", "-").replace("\u2014", "-")
+        if self.match_regex_override:
+            try:
+                return re.search(self.match_regex_override, h, re.I) is not None
+            except Exception:
+                pass
+
+        # Regex patterns capturing common variations
+        patterns = [
+            r"appendix\s*3x",
+            r"appendix\s*3y",
+            r"appendix\s*3z",
+            r"change\s+of\s+director",
+            r"director[^\n]*interest",
+            r"form\s*603",
+            r"form\s*604",
+            r"form\s*605",
+            r"substantial\s+(holder|shareholder|holding)",
+            r"initial\s+director",
+            r"final\s+director",
+        ]
+        # Keyword fallback including user-provided extras
+        keywords = [
+            'appendix 3y', "change of director", "director's interest",
+            'appendix 3x', 'appendix 3z', 'initial director', 'final director',
+            'form 603', 'form 604', 'form 605',
+            'substantial holder', 'substantial shareholder', 'substantial holding'
+        ] + self.extra_keywords
+
+        if any(re.search(p, h, re.I) for p in patterns):
+            return True
+        return any(k in h for k in keywords)
 
     def determine_document_type(self, headline: str) -> str:
         """
@@ -187,25 +457,86 @@ class ASXScraper:
             return "APPENDIX_3X"
         if "appendix 3y" in h or "change of director" in h or "director's interest" in h:
             return "APPENDIX_3Y"
-        if "form 604" in h or "substantial holder" in h or "substantial shareholder" in h:
-            return "FORM_604"
+        if "appendix 3z" in h or "final director" in h:
+            return "APPENDIX_3Y"  # Treat 3Z as director interest class for formatting
+        if ("form 603" in h or "form 604" in h or "form 605" in h or
+                "substantial holder" in h or "substantial shareholder" in h or "substantial holding" in h):
+            return "FORM_604"  # Normalize 603/605 to 604 family for downstream formatting
         return "OTHER"
+
+    def _chat(self, **kwargs):
+        if not self.openai_api_key:
+            raise RuntimeError("OpenAI API key not configured")
+
+        if self._use_new_openai and self._openai_client:
+            return self._openai_client.chat.completions.create(**kwargs)
+
+        if openai:
+            return openai.ChatCompletion.create(**kwargs)
+
+        raise RuntimeError("OpenAI SDK not available")
+
+    def _resolve_pdf_url(self, href: Optional[str]) -> Optional[str]:
+        if not href:
+            return None
+
+        absolute = urljoin(self.base_url, href)
+
+        if absolute.startswith("//"):
+            absolute = f"https:{absolute}"
+
+        if "announcements.asx.com.au/asxpdf" in absolute.lower():
+            return absolute
+
+        try:
+            resp = self.session.get(absolute, timeout=30)
+        except Exception:
+            return None
+
+        if resp.status_code != 200:
+            return None
+
+        match = re.search(r"https://announcements\.asx\.com\.au/asxpdf/[^\"']+\.pdf", resp.text)
+        if match:
+            return match.group(0)
+
+        return None
+
+    @staticmethod
+    def _extract_ids_id(href: Optional[str]) -> str:
+        if not href:
+            return ""
+        match = re.search(r"idsId=([0-9A-Za-z]+)", href)
+        return match.group(1) if match else ""
 
     # ---------- Downloads & text extraction ----------
     def download_pdf(self, url: str) -> str:
         if not url:
             return ""
+        filepath = ""
         try:
             timestamp = int(time.time())
             filename = f"asx_document_{timestamp}.pdf"
             filepath = os.path.join(self.download_dir, filename)
-            r = self.session.get(url, timeout=30)
-            if r.status_code != 200:
+            resp = self.session.get(url, timeout=30, allow_redirects=True, stream=True)
+            if resp.status_code != 200:
                 return ""
+
+            content_type = (resp.headers.get("content-type") or "").lower()
+            if "pdf" not in content_type and not url.lower().endswith(".pdf"):
+                return ""
+
             with open(filepath, "wb") as f:
-                f.write(r.content)
+                for chunk in resp.iter_content(65536):
+                    if chunk:
+                        f.write(chunk)
             return filepath
         except Exception:
+            if filepath and os.path.exists(filepath):
+                try:
+                    os.remove(filepath)
+                except Exception:
+                    pass
             return ""
 
     def extract_text_from_pdf(self, pdf_path: str) -> str:
@@ -347,7 +678,7 @@ class ASXScraper:
 
                 # Use chat completion for structured output
                 # Model name may be changed by you; using gpt-4o-mini as suggested
-                resp = openai.ChatCompletion.create(
+                resp = self._chat(
                     model="gpt-4o-mini",
                     messages=[
                         {"role": "system", "content": system_prompt},
@@ -357,7 +688,7 @@ class ASXScraper:
                     temperature=0.0,
                     n=1
                 )
-                content = resp.choices[0].message.get("content", "").strip()
+                content = (resp.choices[0].message.content or "").strip()
                 model_responses.append(content)
 
                 # parse JSON; if parsing fails, keep raw text
@@ -537,20 +868,20 @@ class ASXScraper:
                 ai_result = self.parse_pdf_with_ai(pdf_path, doc_title=document_title)
             else:
                 # If no PDF, we can call the model with the headline only (best-effort)
-                if openai and self.openai_api_key:
+                if self.openai_api_key:
                     try:
                         prompt = (
                             "You are given an ASX announcement headline. Try to infer document_type and "
                             "basic fields. Return JSON only with the same fields as full parser.\n\n"
                             f"Headline: {document_title}"
                         )
-                        resp = openai.ChatCompletion.create(
+                        resp = self._chat(
                             model="gpt-4o-mini",
                             messages=[{"role": "user", "content": prompt}],
                             temperature=0.0,
                             max_tokens=500
                         )
-                        content = resp.choices[0].message.get("content", "")
+                        content = (resp.choices[0].message.content or "").strip()
                         try:
                             ai_result = json.loads(content)
                         except Exception:
